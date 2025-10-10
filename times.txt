@@ -1,0 +1,2 @@
+Laptop cartpole 50k steps 187.54200553894043s on device: cuda
+Laptop cartpole 50k steps 161.24609780311584s on device: cpu
