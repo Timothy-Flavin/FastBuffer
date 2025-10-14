@@ -1,5 +1,6 @@
 # Threaded RL runner with double models and per-thread FastBuffer
 from threading import Thread, Lock, Event, Condition
+import multiprocessing as mp
 import gymnasium as gym
 import random
 import math
@@ -43,6 +44,10 @@ class ModelManager:
         self._usage = [0, 0]
         self._lock = Lock()
         self._cond = Condition(self._lock)
+        self._broadcast_cb = None  # optional callable to broadcast new weights
+
+    def set_broadcast_callback(self, cb):
+        self._broadcast_cb = cb
 
     def get_active_idx(self) -> int:
         with self._lock:
@@ -98,6 +103,9 @@ class ModelManager:
 
             # Flip active
             self._active_idx = new_active
+        # Broadcast new active CPU weights to workers if callback set
+        if self._broadcast_cb is not None:
+            self._broadcast_cb(self.cpu_models[self._active_idx].state_dict())
 
     def get_training_gpu(self) -> nn.Module:
         return self.gpu_model
@@ -188,57 +196,87 @@ def update_worker(
             manager.swap_from_gpu()
 
 
-def rollout_worker(
-    env,
-    manager: ModelManager,
-    buffer: FastBuffer,
-    buffer_lock: Lock,
+def rollout_worker_proc(
+    data_q: mp.Queue,
+    ctrl_q: mp.Queue,
     num_steps: int,
-    device,
     n_actions: int,
-    thread_id: int,
-    ep_lengths: list,
-    stop_event: Event,
+    seed: int | None = None,
 ):
-    global env_steps_counter
+    """Process-based rollout worker.
+    - Receives weights via ctrl_q (dict state_dict) messages of type 'weights'
+    - Sends transitions via data_q as dicts {type: 'transition', data: {...}} and episode lengths as {type: 'ep_len', value: t}
+    """
+    import gymnasium as gym  # import inside process
+    import torch
+    import numpy as np
+    import random
+
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.manual_seed(seed)
+
+    env = gym.make("CartPole-v1")
+    obs, _ = env.reset()
+    n_observations = len(obs)
+    model = DQN(n_observations, n_actions).to("cpu").float()
+
+    # Wait for initial weights
+    try:
+        msg = ctrl_q.get(timeout=5.0)
+        if msg.get("type") == "weights":
+            state_dict = msg["state_dict"]
+            model.load_state_dict(state_dict)
+    except Exception:
+        pass
+
+    def act(state):
+        # simple epsilon-greedy local to process
+        with torch.no_grad():
+            x = torch.as_tensor(state, dtype=torch.float32).unsqueeze(0)
+            if random.random() < 0.1:
+                return random.randrange(n_actions)
+            return model(x).argmax(dim=1).item()
+
     i_episode = 0
     step = 0
-    while step < num_steps and not stop_event.is_set():
-        state, info = env.reset()
+    while step < num_steps:
+        state, _ = env.reset()
         done = False
         t = 0
-        while not done and not stop_event.is_set():
+        while not done and step < num_steps:
             t += 1
-            action = select_action(state, manager, device, n_actions)
+            # Non-blocking check for weight updates
+            try:
+                while True:
+                    msg = ctrl_q.get_nowait()
+                    if msg.get("type") == "weights":
+                        model.load_state_dict(msg["state_dict"])
+            except Exception:
+                pass
+
+            action = act(state)
             state_, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-
-            buffer.save_transition(
-                data={
-                    "global_rewards": float(reward),
-                    "obs": np.asarray(state, dtype=np.float32),
-                    "obs_": np.asarray(state_, dtype=np.float32),
-                    "discrete_actions": int(action),
-                    "terminated": int(terminated),
-                },
+            # send transition
+            data_q.put(
+                {
+                    "type": "transition",
+                    "data": {
+                        "global_rewards": float(reward),
+                        "obs": np.asarray(state, dtype=np.float32),
+                        "obs_": np.asarray(state_, dtype=np.float32),
+                        "discrete_actions": int(action),
+                        "terminated": int(terminated),
+                    },
+                }
             )
-
             state = state_
-
-            # Periodically push to GPU
-            if buffer.steps_recorded % 512 == 0:
-                with buffer_lock:
-                    buffer.update_gpu()
-
             if done:
-                # print(f"[Thread {thread_id}] ep_len: {t} ep: {i_episode} total_step: {step}")
-                ep_lengths.append(t)
+                data_q.put({"type": "ep_len", "value": t})
                 i_episode += 1
             step += 1
-
-    # Final GPU sync for any remaining data
-    with buffer_lock:
-        buffer.update_gpu()
 
 
 if __name__ == "__main__":
@@ -274,7 +312,7 @@ if __name__ == "__main__":
 
     # Memory buffers: one per CPU worker
     total_memory = 20000
-    num_cpu_workers = 8
+    num_cpu_workers = 2
     per_buffer = total_memory // num_cpu_workers
     buffers = []
     buffer_locks: list[Lock] = []
@@ -316,7 +354,7 @@ if __name__ == "__main__":
         )
         buffer_locks.append(Lock())
 
-    # Thread management
+    # Thread/process management
     stop_event = Event()
     start = time.time()
 
@@ -328,31 +366,74 @@ if __name__ == "__main__":
     )
     updater.start()
 
-    # Start rollout workers and collect per-thread episode lengths
+    # Start rollout worker processes and queues
     per_thread_ep_lengths: list[list[int]] = [[] for _ in range(num_cpu_workers)]
-    workers = []
-    for i in range(num_cpu_workers):
-        w = Thread(
-            target=rollout_worker,
-            args=(
-                gym.make("CartPole-v1"),
-                manager,
-                buffers[i],
-                buffer_locks[i],
-                NUM_STEPS // num_cpu_workers,
-                device,
-                n_actions,
-                i,
-                per_thread_ep_lengths[i],
-                stop_event,
-            ),
-            daemon=True,
-        )
-        w.start()
-        workers.append(w)
+    data_queues: list[mp.Queue] = [
+        mp.Queue(maxsize=2048) for _ in range(num_cpu_workers)
+    ]
+    ctrl_queues: list[mp.Queue] = [mp.Queue() for _ in range(num_cpu_workers)]
+    procs: list[mp.Process] = []
 
-    for w in workers:
-        w.join()
+    # Broadcast initial weights from active CPU to workers
+    manager.copy_active_cpu_to_gpu()
+    init_sd_cpu = manager.cpu_models[manager.get_active_idx()].state_dict()
+    for cq in ctrl_queues:
+        cq.put({"type": "weights", "state_dict": init_sd_cpu})
+
+    for i in range(num_cpu_workers):
+        p = mp.Process(
+            target=rollout_worker_proc,
+            args=(
+                data_queues[i],
+                ctrl_queues[i],
+                NUM_STEPS // num_cpu_workers,
+                n_actions,
+                1000 + i,
+            ),
+        )
+        p.daemon = True
+        p.start()
+        procs.append(p)
+
+    # Set broadcast callback to push new weights to all workers after swaps
+    def _broadcast_weights(state_dict):
+        for cq in ctrl_queues:
+            cq.put({"type": "weights", "state_dict": state_dict})
+
+    manager.set_broadcast_callback(_broadcast_weights)
+
+    # Collector loop: drain data queues into FastBuffers and push to GPU periodically
+    last_push_time = time.time()
+    active = True
+    while any(p.is_alive() for p in procs):
+        for i, dq in enumerate(data_queues):
+            try:
+                msg = dq.get(timeout=0.01)
+            except Exception:
+                msg = None
+            if not msg:
+                continue
+            if msg["type"] == "transition":
+                buffers[i].save_transition(msg["data"])
+            elif msg["type"] == "ep_len":
+                per_thread_ep_lengths[i].append(msg["value"])
+
+        # Periodic GPU sync for all buffers
+        now = time.time()
+        if now - last_push_time > 0.05:  # 50ms
+            for i, buf in enumerate(buffers):
+                if buf.steps_recorded - buf.gpu_steps_recorded >= 2048:
+                    with buffer_locks[i]:
+                        buf.update_gpu()
+            last_push_time = now
+
+    # Ensure final GPU sync
+    for i, buf in enumerate(buffers):
+        with buffer_locks[i]:
+            buf.update_gpu()
+
+    for p in procs:
+        p.join()
     stop_event.set()
     updater.join(timeout=1.0)
     end = time.time()
