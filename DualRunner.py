@@ -9,9 +9,9 @@ import torch.nn.functional as F
 import time
 from FastBuffer import FastBuffer
 
-NUM_STEPS = 50000
+NUM_STEPS = 100000
 BUFFER_LEN = 10000
-BATCH_SIZE = 512
+BATCH_SIZE = 256
 GAMMA = 0.99
 EPS_START = 0.9
 EPS_END = 0.05

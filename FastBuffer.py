@@ -165,14 +165,12 @@ class FastBuffer:
                         gt[k][:, gpu_idxs] = (
                             self.cpu_tensors[k][:, idxs]
                             .detach()
-                            .clone()
                             .to(gt[k].device, non_blocking=True)
                         )
                     else:
                         gt[k][gpu_idxs] = (
                             self.cpu_tensors[k][idxs]
                             .detach()
-                            .clone()
                             .to(gt[k].device, non_blocking=True)
                         )
 
@@ -181,13 +179,11 @@ class FastBuffer:
                         gt["action_mask"][i][:, gpu_idxs] = (
                             self.cpu_tensors["action_mask"][i][:, idxs]
                             .detach()
-                            .clone()
                             .to(gt["action_mask"][i].device, non_blocking=True)
                         )
                         gt["action_mask_"][i][:, gpu_idxs] = (
                             self.cpu_tensors["action_mask_"][i][:, idxs]
                             .detach()
-                            .clone()
                             .to(gt["action_mask_"][i].device, non_blocking=True)
                         )
 
@@ -210,26 +206,39 @@ class FastBuffer:
                 f"Not enough steps recorded to sample {batch_size} transitions"
             )
         if idxs is None:
+            # generate indices on the device to avoid host->device index copy
+            device = tensors[list(self.registered_vars.keys())[0]].device
             idxs = torch.randint(
-                0,
-                steps_recorded,
-                size=(batch_size,),
-                device=tensors[list(self.registered_vars.keys())[0]].device,
+                0, steps_recorded, size=(batch_size,), device=device, dtype=torch.long
             )
+        else:
+            # Ensure idxs is a long tensor on the correct device
+            if not isinstance(idxs, torch.Tensor):
+                device = tensors[list(self.registered_vars.keys())[0]].device
+                idxs = torch.as_tensor(idxs, dtype=torch.long, device=device)
+            else:
+                device = tensors[list(self.registered_vars.keys())[0]].device
+                idxs = idxs.to(device=device, dtype=torch.long)
+
         batch = {}
         for k in self.registered_vars.keys():
             v = self.registered_vars[k]
             if v["per_agent"]:
-                batch[k] = tensors[k][:, idxs].clone().detach()
+                # per_agent tensors have shape [n_agents, buffer_len, ...]
+                # use index_select on dim=1 to avoid advanced indexing overhead
+                batch[k] = tensors[k].index_select(1, idxs).contiguous()
             else:
-                batch[k] = tensors[k][idxs].clone().detach()
+                # shape [buffer_len, ...], select on dim=0
+                batch[k] = tensors[k].index_select(0, idxs).contiguous()
+
         if self.has_action_mask:
             batch["action_mask"] = [
-                m[:, idxs].clone().detach() for m in tensors["action_mask"]
+                m.index_select(1, idxs).contiguous() for m in tensors["action_mask"]
             ]
             batch["action_mask_"] = [
-                m[:, idxs].clone().detach() for m in tensors["action_mask_"]
+                m.index_select(1, idxs).contiguous() for m in tensors["action_mask_"]
             ]
+
         return batch, idxs
 
     def reset(self):
