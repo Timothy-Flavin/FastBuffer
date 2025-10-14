@@ -91,7 +91,7 @@ class FastBuffer:
                     data[k], dtype=v["dtype"]
                 )
         self.current_cpu_idx += 1
-        self.steps_recorded += 1
+        self.steps_recorded = min(self.steps_recorded + 1, self.buffer_len)
         if self.current_cpu_idx >= self.buffer_len:
             self.current_cpu_idx = 0
             self.cpu_wrap_around = True

@@ -27,18 +27,18 @@ class DQN(nn.Module):
 
 
 class ModelManager:
-    """Manages acting CPU models and training GPU models with safe swap and copies.
+    """Manages two CPU actor models and a single GPU training model.
 
-    cpu_models: used by rollout workers for inference (on CPU)
-    gpu_models: used by update worker for training (on GPU)
+    Pipeline:
+    1) Actors collect with cpu_models[active_idx]; gpu_model is a copy at swap time.
+    2) Trainer updates gpu_model from buffers.
+    3) Occasionally copy gpu_model -> cpu_models[inactive_idx] and then flip active_idx.
     """
 
-    def __init__(self, cpu_models: list[nn.Module], gpu_models: list[nn.Module]):
-        assert (
-            len(cpu_models) == 2 and len(gpu_models) == 2
-        ), "Expect two CPU and two GPU models"
+    def __init__(self, cpu_models: list[nn.Module], gpu_model: nn.Module):
+        assert len(cpu_models) == 2, "Expect exactly two CPU models"
         self.cpu_models = cpu_models
-        self.gpu_models = gpu_models
+        self.gpu_model = gpu_model
         self._active_idx = 0
         self._usage = [0, 0]
         self._lock = Lock()
@@ -48,7 +48,7 @@ class ModelManager:
         with self._lock:
             return self._active_idx
 
-    def get_training_idx(self) -> int:
+    def get_inactive_idx(self) -> int:
         with self._lock:
             return 1 - self._active_idx
 
@@ -67,37 +67,40 @@ class ModelManager:
             if self._usage[idx] == 0:
                 self._cond.notify_all()
 
-    def switch_active_and_copy_when_safe(self):
-        """Switch active to the training model.
+    def copy_active_cpu_to_gpu(self):
+        """Copy active CPU model weights into the single GPU model."""
+        active_sd = self.cpu_models[self._active_idx].state_dict()
+        self.gpu_model.load_state_dict(
+            {
+                k: v.to(next(self.gpu_model.parameters()).device)
+                for k, v in active_sd.items()
+            }
+        )
 
-        Sequence:
-        - Flip active to the other index (the one being trained on GPU)
-        - Wait until old active CPU model is not being used by any rollout thread
-        - Copy weights:
-            gpu_models[new_active] -> cpu_models[new_active]  (actors use latest)
-            cpu_models[new_active] -> gpu_models[old_active]  (initialize new training)
+    def swap_from_gpu(self):
+        """Copy GPU -> inactive CPU, then make it active.
+
+        Ensures old active has zero readers before flipping.
+        After swap, actors use the CPU model that was just synced from GPU.
         """
         with self._lock:
             old_active = self._active_idx
             new_active = 1 - old_active
-            self._active_idx = new_active
+            # Wait until old active CPU model has no active users
             while self._usage[old_active] > 0:
                 self._cond.wait(timeout=0.01)
 
-        # Copy GPU->CPU for new active
-        self.cpu_models[new_active].load_state_dict(
-            {k: v.cpu() for k, v in self.gpu_models[new_active].state_dict().items()}
-        )
-        # Initialize new training model with current active CPU weights (CPU->GPU)
-        self.gpu_models[old_active].load_state_dict(
-            {
-                k: v.to(next(self.gpu_models[old_active].parameters()).device)
-                for k, v in self.cpu_models[new_active].state_dict().items()
-            }
-        )
+            # Copy GPU -> inactive CPU
+            gpu_sd = self.gpu_model.state_dict()
+            self.cpu_models[new_active].load_state_dict(
+                {k: v.cpu() for k, v in gpu_sd.items()}
+            )
+
+            # Flip active
+            self._active_idx = new_active
 
     def get_training_gpu(self) -> nn.Module:
-        return self.gpu_models[self.get_training_idx()]
+        return self.gpu_model
 
 
 def select_action(state, manager: ModelManager, device, n_actions):
@@ -157,10 +160,10 @@ def update_worker(
     manager: ModelManager,
     buffers,
     buffer_locks,
-    optimizers,
+    optimizer,
     device,
     stop_event: Event,
-    switch_every: int = 20,
+    switch_every: int = 5,
 ):
     n_step = 0
     # Ratio gating to prevent training from outpacing data collection
@@ -168,9 +171,7 @@ def update_worker(
     while not stop_event.is_set():
         # throttle updates based on collected env steps
 
-        training_idx = manager.get_training_idx()
         model = manager.get_training_gpu()
-        optimizer = optimizers[training_idx]
         # Train across buffers
         for i, buffer in enumerate(buffers):
             if stop_event.is_set():
@@ -183,7 +184,8 @@ def update_worker(
         # print(f"Update step {n_step} done")
         # Periodic swap
         if n_step % switch_every == 0:
-            manager.switch_active_and_copy_when_safe()
+            # After some training, deploy GPU -> inactive CPU and flip
+            manager.swap_from_gpu()
 
 
 def rollout_worker(
@@ -246,10 +248,8 @@ if __name__ == "__main__":
     GAMMA = 0.99
     EPS_START = 0.9
     EPS_END = 0.05
-    EPS_DECAY = 5000
+    EPS_DECAY = 50000
     LR = 3e-4
-    # max updates per env step (across all buffers)
-    ENV_TO_UPDATE_RATIO = 1.0
     # shared counters for gating
     env_steps_counter = 0
     update_steps_counter = 0
@@ -260,30 +260,21 @@ if __name__ == "__main__":
     state, info = env.reset()
     n_observations = len(state)
 
-    # Two models for CPU inference and two for GPU training
+    # Two CPU actor models and one GPU training model
     cpu_model0 = DQN(n_observations, n_actions).to("cpu").float()
     cpu_model1 = DQN(n_observations, n_actions).to("cpu").float()
-    gpu_model0 = DQN(n_observations, n_actions).to(device).float()
-    gpu_model1 = DQN(n_observations, n_actions).to(device).float()
-    # Initialize both pairs identically
+    gpu_model = DQN(n_observations, n_actions).to(device).float()
+    # Initialize the inactive cpu model with the same weights
     cpu_model1.load_state_dict(cpu_model0.state_dict())
-    gpu_model1.load_state_dict(gpu_model0.state_dict())
-
-    # Sync cpu_model0 with gpu_model0 (start from same weights)
-    cpu_model0.load_state_dict({k: v.cpu() for k, v in gpu_model0.state_dict().items()})
-    cpu_model1.load_state_dict({k: v.cpu() for k, v in gpu_model1.state_dict().items()})
-
-    optimizers = [
-        optim.AdamW(gpu_model0.parameters(), lr=LR, amsgrad=True),
-        optim.AdamW(gpu_model1.parameters(), lr=LR, amsgrad=True),
-    ]
-
-    manager = ModelManager([cpu_model0, cpu_model1], [gpu_model0, gpu_model1])
+    manager = ModelManager([cpu_model0, cpu_model1], gpu_model)
+    # Copy active CPU -> GPU at start (pipeline step 1 -> 2)
+    manager.copy_active_cpu_to_gpu()
+    optimizer = optim.AdamW(gpu_model.parameters(), lr=LR, amsgrad=True)
     steps_done = 0
 
     # Memory buffers: one per CPU worker
-    total_memory = 40000
-    num_cpu_workers = 4
+    total_memory = 20000
+    num_cpu_workers = 8
     per_buffer = total_memory // num_cpu_workers
     buffers = []
     buffer_locks: list[Lock] = []
@@ -332,7 +323,7 @@ if __name__ == "__main__":
     # Start update worker
     updater = Thread(
         target=update_worker,
-        args=(manager, buffers, buffer_locks, optimizers, device, stop_event, 200),
+        args=(manager, buffers, buffer_locks, optimizer, device, stop_event, 200),
         daemon=True,
     )
     updater.start()
