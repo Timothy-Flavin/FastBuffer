@@ -1,7 +1,5 @@
-# Example single agent using flexibuff
-# with torch dqn example modified from
-# https://pytorch.org/tutorials/intermediate/reinforcement_q_learning.html
-from threading import Thread
+# Threaded RL runner with double models and per-thread FastBuffer
+from threading import Thread, Lock, Event, Condition
 import gymnasium as gym
 import random
 import math
@@ -9,10 +7,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
 import numpy as np
 import time
 from FastBuffer import FastBuffer
+import matplotlib.pyplot as plt
 
 
 class DQN(nn.Module):
@@ -28,9 +26,84 @@ class DQN(nn.Module):
         return self.layer3(x)
 
 
-def select_action(state, model):
+class ModelManager:
+    """Manages acting CPU models and training GPU models with safe swap and copies.
+
+    cpu_models: used by rollout workers for inference (on CPU)
+    gpu_models: used by update worker for training (on GPU)
+    """
+
+    def __init__(self, cpu_models: list[nn.Module], gpu_models: list[nn.Module]):
+        assert (
+            len(cpu_models) == 2 and len(gpu_models) == 2
+        ), "Expect two CPU and two GPU models"
+        self.cpu_models = cpu_models
+        self.gpu_models = gpu_models
+        self._active_idx = 0
+        self._usage = [0, 0]
+        self._lock = Lock()
+        self._cond = Condition(self._lock)
+
+    def get_active_idx(self) -> int:
+        with self._lock:
+            return self._active_idx
+
+    def get_training_idx(self) -> int:
+        with self._lock:
+            return 1 - self._active_idx
+
+    def acquire_active_cpu(self) -> tuple[nn.Module, int]:
+        """Increment usage for active model and return it with its index.
+        Call release(idx) when done.
+        """
+        with self._lock:
+            idx = self._active_idx
+            self._usage[idx] += 1
+            return self.cpu_models[idx], idx
+
+    def release(self, idx: int):
+        with self._lock:
+            self._usage[idx] -= 1
+            if self._usage[idx] == 0:
+                self._cond.notify_all()
+
+    def switch_active_and_copy_when_safe(self):
+        """Switch active to the training model.
+
+        Sequence:
+        - Flip active to the other index (the one being trained on GPU)
+        - Wait until old active CPU model is not being used by any rollout thread
+        - Copy weights:
+            gpu_models[new_active] -> cpu_models[new_active]  (actors use latest)
+            cpu_models[new_active] -> gpu_models[old_active]  (initialize new training)
+        """
+        with self._lock:
+            old_active = self._active_idx
+            new_active = 1 - old_active
+            self._active_idx = new_active
+            while self._usage[old_active] > 0:
+                self._cond.wait(timeout=0.01)
+
+        # Copy GPU->CPU for new active
+        self.cpu_models[new_active].load_state_dict(
+            {k: v.cpu() for k, v in self.gpu_models[new_active].state_dict().items()}
+        )
+        # Initialize new training model with current active CPU weights (CPU->GPU)
+        self.gpu_models[old_active].load_state_dict(
+            {
+                k: v.to(next(self.gpu_models[old_active].parameters()).device)
+                for k, v in self.cpu_models[new_active].state_dict().items()
+            }
+        )
+
+    def get_training_gpu(self) -> nn.Module:
+        return self.gpu_models[self.get_training_idx()]
+
+
+def select_action(state, manager: ModelManager, device, n_actions):
     with torch.no_grad():
-        state = torch.from_numpy(state)[None, :].to(device)
+        # Inference on CPU for better throughput with many small batches
+        state_t = torch.as_tensor(state, device="cpu").unsqueeze(0).float()
         global steps_done
         sample = random.random()
         eps_threshold = EPS_END + (EPS_START - EPS_END) * math.exp(
@@ -38,164 +111,188 @@ def select_action(state, model):
         )
         steps_done += 1
         if sample > eps_threshold:
-            with torch.no_grad():
-                # t.max(1) will return the largest column value of each row.
-                # second column on max result is index of where max element was
-                # found, so we pick action with the larger expected reward.
-                return model(state).max(1).indices.view(1, 1).cpu().item()
+            model, idx = manager.acquire_active_cpu()
+            try:
+                return model(state_t).argmax(dim=1).item()
+            finally:
+                manager.release(idx)
         else:
-            return (
-                torch.tensor(
-                    [[env.action_space.sample()]], device=device, dtype=torch.long
-                )
-                .cpu()
-                .item()
-            )
+            return random.randrange(n_actions)
 
 
-def optimize_model(model, buffer, optimizer):
-    global BATCH_SIZE
-    global GAMMA
+def optimize_model(model, buffer: FastBuffer, optimizer, device):
+    global BATCH_SIZE, GAMMA
 
-    if buffer.steps_recorded < BATCH_SIZE:
+    if buffer.gpu_steps_recorded < BATCH_SIZE:
         return
     transitions, idx = buffer.sample_transitions(BATCH_SIZE)
-    term = transitions["terminated"]
-    # print(transitions)
+
+    obs = transitions["obs"].to(device)
+    obs_ = transitions["obs_"].to(device)
+    acts = transitions["discrete_actions"].to(device)
+    rews = transitions["global_rewards"].to(device)
+    term = transitions.get("terminated")
     if term is None:
         term = torch.zeros((BATCH_SIZE,), dtype=torch.bool, device=device)
-    # print(transitions)
-    # [0] because we are doing this for just the first agent because there is only one agent
-    Q = model(transitions["obs"]).gather(
-        1, transitions["discrete_actions"].unsqueeze(-1)
-    )[:, 0]
+    else:
+        term = term.to(device).bool()
 
-    # print(
-    #    f"Gamma: {GAMMA} * {policy_net(transitions.obs_[0]).max(1).values} * { (1 - transitions.terminated)} + {transitions.global_rewards}"
-    # )
-    with torch.no_grad():  # no need to track gradient for next Q value
-        Q_NEXT = (
-            GAMMA  # obs [0] because we are only using 1 agent again
-            * model(transitions["obs_"]).max(1).values
-            * (1 - term)  # Terminated and global rewards do
-            + transitions["global_rewards"]  # not need to be [0] because they
-        )  # are for all agents
-    # Compute MSE loss
+    # Q(s,a)
+    q_values = model(obs)
+    q = q_values.gather(1, acts.long().unsqueeze(-1))[:, 0]
+
+    with torch.no_grad():
+        q_next = model(obs_).max(1).values
+        target = GAMMA * q_next * (~term) + rews
+
     criterion = nn.MSELoss()
-    loss = criterion(Q, Q_NEXT)
+    loss = criterion(q, target)
 
-    # Optimize the model
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    # In-place gradient clipping
-    # torch.nn.utils.clip_grad_value_(policy_net.parameters(), 100)
     optimizer.step()
 
 
-def update_worker(active_net: int, buffer_locks, models, buffers, optimizer):
+def update_worker(
+    manager: ModelManager,
+    buffers,
+    buffer_locks,
+    optimizers,
+    device,
+    stop_event: Event,
+    switch_every: int = 20,
+):
     n_step = 0
-    training_net = 1 - active_net
-    while True:
+    # Ratio gating to prevent training from outpacing data collection
+    global env_steps_counter, update_steps_counter
+    while not stop_event.is_set():
+        # throttle updates based on collected env steps
+
+        training_idx = manager.get_training_idx()
+        model = manager.get_training_gpu()
+        optimizer = optimizers[training_idx]
+        # Train across buffers
         for i, buffer in enumerate(buffers):
-            if buffer.steps_recorded > 512:
-                # Perform one step of the optimization (on the policy network)
-                buffer_locks[i].acquire()
-                optimize_model(models[training_net], buffer, optimizer)
-                buffer_locks[i].release()
-            n_step += 1
-        if n_step % 10 == 0:
-            active_net = 1 - active_net
-            training_net = 1 - active_net
-            # TODO: wait until all actions on the active net are done then copy the weights
-            models[training_net].load_state_dict(models[active_net].state_dict())
+            if stop_event.is_set():
+                break
+            if buffer.gpu_steps_recorded >= BATCH_SIZE * 4:
+                with buffer_locks[i]:
+                    optimize_model(model, buffer, optimizer, device)
+
+        n_step += 1
+        # print(f"Update step {n_step} done")
+        # Periodic swap
+        if n_step % switch_every == 0:
+            manager.switch_active_and_copy_when_safe()
 
 
 def rollout_worker(
-    env, models, buffers, buffer_locks, num_steps, thread_id=0, active_net: int = 0
+    env,
+    manager: ModelManager,
+    buffer: FastBuffer,
+    buffer_lock: Lock,
+    num_steps: int,
+    device,
+    n_actions: int,
+    thread_id: int,
+    ep_lengths: list,
+    stop_event: Event,
 ):
-    ts = []
-    es = []
+    global env_steps_counter
     i_episode = 0
     step = 0
-    while step < num_steps:
-        # Initialize the environment and get its state
-        es.append(0)
-        done = False
+    while step < num_steps and not stop_event.is_set():
         state, info = env.reset()
+        done = False
         t = 0
-        while not done:
+        while not done and not stop_event.is_set():
             t += 1
-            # TODO: Mark that this network is in action so the update thread waits to copy weights
-            action = select_action(state, models[active_net])
+            action = select_action(state, manager, device, n_actions)
             state_, reward, terminated, truncated, _ = env.step(action)
-            es[-1] += reward
             done = terminated or truncated
 
-            # Store the transition in memory which accepts np arrays
-            buffers[thread_id].save_transition(
+            buffer.save_transition(
                 data={
-                    "global_rewards": reward,
-                    "obs": state,
-                    "obs_": state_,
-                    "discrete_actions": [action],
-                    "terminated": terminated,
+                    "global_rewards": float(reward),
+                    "obs": np.asarray(state, dtype=np.float32),
+                    "obs_": np.asarray(state_, dtype=np.float32),
+                    "discrete_actions": int(action),
+                    "terminated": int(terminated),
                 },
             )
 
-            # Move to the next state
             state = state_
-            if buffers[thread_id].steps_recorded % 512 == 0:
-                # acquire the gpu lock and update gpu tensors
-                buffer_locks[thread_id].acquire()
-                buffers[thread_id].update_gpu()
-                buffer_locks[thread_id].release()
+
+            # Periodically push to GPU
+            if buffer.steps_recorded % 512 == 0:
+                with buffer_lock:
+                    buffer.update_gpu()
 
             if done:
-                print(f"len: {t} ep: {i_episode} total_step: {step}")
-                ts.append(t)
+                # print(f"[Thread {thread_id}] ep_len: {t} ep: {i_episode} total_step: {step}")
+                ep_lengths.append(t)
                 i_episode += 1
             step += 1
-    return ts, es
+
+    # Final GPU sync for any remaining data
+    with buffer_lock:
+        buffer.update_gpu()
 
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    NUM_STEPS = 50000
-    BATCH_SIZE = 256
+    NUM_STEPS = 200000
+    BATCH_SIZE = 512
     GAMMA = 0.99
     EPS_START = 0.9
     EPS_END = 0.05
-    EPS_DECAY = 1000
-    LR = 1e-4
+    EPS_DECAY = 5000
+    LR = 3e-4
+    # max updates per env step (across all buffers)
+    ENV_TO_UPDATE_RATIO = 1.0
+    # shared counters for gating
+    env_steps_counter = 0
+    update_steps_counter = 0
+    counters_lock = Lock()
 
     env = gym.make("CartPole-v1")
-    # Get number of actions from gym action space
     n_actions = env.action_space.n  # type: ignore
-    # Get the number of state observations
     state, info = env.reset()
     n_observations = len(state)
 
-    policy_net1 = DQN(n_observations, n_actions).to(device).float()
-    policy_net2 = DQN(n_observations, n_actions).to(device).float()
-    policy_net2.load_state_dict(policy_net1.state_dict())
-    optimizer1 = optim.AdamW(policy_net1.parameters(), lr=LR, amsgrad=True)
-    optimizer2 = optim.AdamW(policy_net2.parameters(), lr=LR, amsgrad=True)
+    # Two models for CPU inference and two for GPU training
+    cpu_model0 = DQN(n_observations, n_actions).to("cpu").float()
+    cpu_model1 = DQN(n_observations, n_actions).to("cpu").float()
+    gpu_model0 = DQN(n_observations, n_actions).to(device).float()
+    gpu_model1 = DQN(n_observations, n_actions).to(device).float()
+    # Initialize both pairs identically
+    cpu_model1.load_state_dict(cpu_model0.state_dict())
+    gpu_model1.load_state_dict(gpu_model0.state_dict())
 
-    active_net = policy_net1
-    active_opt = optimizer1
+    # Sync cpu_model0 with gpu_model0 (start from same weights)
+    cpu_model0.load_state_dict({k: v.cpu() for k, v in gpu_model0.state_dict().items()})
+    cpu_model1.load_state_dict({k: v.cpu() for k, v in gpu_model1.state_dict().items()})
+
+    optimizers = [
+        optim.AdamW(gpu_model0.parameters(), lr=LR, amsgrad=True),
+        optim.AdamW(gpu_model1.parameters(), lr=LR, amsgrad=True),
+    ]
+
+    manager = ModelManager([cpu_model0, cpu_model1], [gpu_model0, gpu_model1])
     steps_done = 0
 
-    # Set up the memory buffer for use with one agent,
-    # global reward and one discrete action output
-    total_memory = 10000
-    num_cpus_buffers = 1
-    memories = []
-    for _ in range(num_cpus_buffers):
-        memories.append(
+    # Memory buffers: one per CPU worker
+    total_memory = 40000
+    num_cpu_workers = 4
+    per_buffer = total_memory // num_cpu_workers
+    buffers = []
+    buffer_locks: list[Lock] = []
+    for _ in range(num_cpu_workers):
+        buffers.append(
             FastBuffer(
-                buffer_len=total_memory // num_cpus_buffers,
+                buffer_len=per_buffer,
                 n_agents=1,
-                discrete_cardonalities=[2],
+                discrete_cardonalities=[n_actions],
                 registered_vars={
                     "global_rewards": {
                         "dim": None,
@@ -223,23 +320,62 @@ if __name__ == "__main__":
                         "per_agent": False,
                     },
                 },
-                gpu=device == "cuda",
+                gpu=(device == "cuda"),
             )
         )
+        buffer_locks.append(Lock())
 
+    # Thread management
+    stop_event = Event()
     start = time.time()
-    Thread(
-        target=update_worker, args=(env, policy_net2, memories, optimizer2, NUM_STEPS)
-    ).start()
-    for c in range(num_cpus_buffers):
-        Thread(
-            target=rollout_worker,
-            args=(env, policy_net1, memories[c], NUM_STEPS),
-        ).start()
-    end = time.time()
 
-    # print(f"Time elapsed: {end-start}s on device: {device}")
-    # print("Complete")
-    # plt.plot(ep_rewards)
-    # plt.title(f"rewards over {end-start}s")
-    # plt.show()
+    # Start update worker
+    updater = Thread(
+        target=update_worker,
+        args=(manager, buffers, buffer_locks, optimizers, device, stop_event, 200),
+        daemon=True,
+    )
+    updater.start()
+
+    # Start rollout workers and collect per-thread episode lengths
+    per_thread_ep_lengths: list[list[int]] = [[] for _ in range(num_cpu_workers)]
+    workers = []
+    for i in range(num_cpu_workers):
+        w = Thread(
+            target=rollout_worker,
+            args=(
+                gym.make("CartPole-v1"),
+                manager,
+                buffers[i],
+                buffer_locks[i],
+                NUM_STEPS // num_cpu_workers,
+                device,
+                n_actions,
+                i,
+                per_thread_ep_lengths[i],
+                stop_event,
+            ),
+            daemon=True,
+        )
+        w.start()
+        workers.append(w)
+
+    for w in workers:
+        w.join()
+    stop_event.set()
+    updater.join(timeout=1.0)
+    end = time.time()
+    print(f"Finished in {end - start:.2f}s on device {device}")
+
+    # Combine episode lengths from all threads for later plotting
+    all_ep_lengths = [length for lst in per_thread_ep_lengths for length in lst]
+    for lst in per_thread_ep_lengths:
+        plt.plot(lst)
+    plt.title("Episode Lengths over Time")
+    plt.xlabel("Episode")
+    plt.ylabel("Length")
+    plt.show()
+    print(f"Collected {len(all_ep_lengths)} episodes across {num_cpu_workers} threads")
+    for i, lst in enumerate(per_thread_ep_lengths):
+        tail = lst[-5:] if len(lst) >= 5 else lst
+        print(f"Thread {i}: {len(lst)} episodes, last up to 5: {tail}")
