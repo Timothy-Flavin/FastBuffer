@@ -53,9 +53,16 @@ class FastBuffer:
                 if isinstance(v["dim"], typing.Iterable):
                     dim = dim + list(v["dim"])
             print(f"Setting up tensor {k} with dim {dim} and dtype {v['dtype']}")
-            self.cpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"])
+            # Allocate CPU tensors. When GPU is enabled, allocate CPU
+            # tensors with pinned memory to allow non-blocking (async)
+            # transfers to the device.
             if self.gpu_enabled:
+                self.cpu_tensors[k] = torch.zeros(
+                    *dim, dtype=v["dtype"], pin_memory=True
+                )
                 self.gpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
+            else:
+                self.cpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"])
 
         if self.has_action_mask:
             self.masks = []
@@ -107,20 +114,34 @@ class FastBuffer:
             raise RuntimeError("GPU not enabled for this buffer")
         if self.full_buffer_refresh:
             for k in self.registered_vars.keys():
+                # detach and clone to avoid warnings about views or autograd
+                # tracked tensors, then transfer to GPU using non_blocking
+                # copy (effective when CPU tensors are pinned).
                 self.gpu_tensors[k][:] = (
                     self.cpu_tensors[k][:]
                     .detach()
                     .clone()
-                    .to(self.gpu_tensors[k].device)
+                    .to(self.gpu_tensors[k].device, non_blocking=True)
                 )
             if self.has_action_mask:
                 for i in range(len(self.masks)):
-                    self.gpu_tensors["action_mask"][i][:] = self.cpu_tensors[
-                        "action_mask"
-                    ][i][:]
-                    self.gpu_tensors["action_mask_"][i][:] = self.cpu_tensors[
-                        "action_mask_"
-                    ][i][:]
+                    self.gpu_tensors["action_mask"][i][:] = (
+                        self.cpu_tensors["action_mask"][i][:]
+                        .detach()
+                        .clone()
+                        .to(
+                            self.gpu_tensors["action_mask"][i].device, non_blocking=True
+                        )
+                    )
+                    self.gpu_tensors["action_mask_"][i][:] = (
+                        self.cpu_tensors["action_mask_"][i][:]
+                        .detach()
+                        .clone()
+                        .to(
+                            self.gpu_tensors["action_mask_"][i].device,
+                            non_blocking=True,
+                        )
+                    )
             self.full_buffer_refresh = False
         else:
             if self.current_cpu_idx > self.last_gpu_idx:
@@ -135,23 +156,42 @@ class FastBuffer:
                 )
                 gpu_idxs = idxs.detach().clone().cuda()
             for k in self.registered_vars.keys():
+                # Copy slices safely: detach and clone on CPU then transfer
+                # non-blocking to GPU (requires pinned CPU memory to be async).
                 if self.registered_vars[k]["per_agent"]:
-                    self.gpu_tensors[k][:, gpu_idxs] = self.cpu_tensors[k][:, idxs].to(
-                        self.gpu_tensors[k].device
+                    self.gpu_tensors[k][:, gpu_idxs] = (
+                        self.cpu_tensors[k][:, idxs]
+                        .detach()
+                        .clone()
+                        .to(self.gpu_tensors[k].device, non_blocking=True)
                     )
                 else:
-                    self.gpu_tensors[k][gpu_idxs] = self.cpu_tensors[k][idxs].to(
-                        self.gpu_tensors[k].device
+                    self.gpu_tensors[k][gpu_idxs] = (
+                        self.cpu_tensors[k][idxs]
+                        .detach()
+                        .clone()
+                        .to(self.gpu_tensors[k].device, non_blocking=True)
                     )
 
             if self.has_action_mask:
                 for i in range(len(self.masks)):
-                    self.gpu_tensors["action_mask"][i][:, gpu_idxs] = self.cpu_tensors[
-                        "action_mask"
-                    ][i][:, idxs]
-                    self.gpu_tensors["action_mask_"][i][:, gpu_idxs] = self.cpu_tensors[
-                        "action_mask_"
-                    ][i][:, idxs]
+                    self.gpu_tensors["action_mask"][i][:, gpu_idxs] = (
+                        self.cpu_tensors["action_mask"][i][:, idxs]
+                        .detach()
+                        .clone()
+                        .to(
+                            self.gpu_tensors["action_mask"][i].device, non_blocking=True
+                        )
+                    )
+                    self.gpu_tensors["action_mask_"][i][:, gpu_idxs] = (
+                        self.cpu_tensors["action_mask_"][i][:, idxs]
+                        .detach()
+                        .clone()
+                        .to(
+                            self.gpu_tensors["action_mask_"][i].device,
+                            non_blocking=True,
+                        )
+                    )
         self.last_gpu_idx = self.current_cpu_idx
         self.gpu_steps_recorded = self.steps_recorded
 

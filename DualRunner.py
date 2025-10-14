@@ -19,7 +19,7 @@ EPS_START = 0.9
 EPS_END = 0.05
 EPS_DECAY = 1000
 LR = 1e-4
-MODEL_SYNC_EVERY = 10
+MODEL_SYNC_EVERY = 5
 MEMORY_SYNC_EVERY = 1024
 
 
@@ -118,6 +118,7 @@ def runner_thread(
     obs = torch.tensor(obs, dtype=torch.float32)
     episode_rewards = []
     overall_steps = 0
+    last_print = 0
     episodes = 0
     ep_rewards = []
     smooth_reward = 0.0
@@ -164,9 +165,11 @@ def runner_thread(
                 if episodes > 0
                 else total_reward
             )
-            print(
-                f"Thread {thread_id}, Overall Step {overall_steps}, Reward: {total_reward}, Smooth Reward: {smooth_reward}"
-            )
+            if overall_steps > last_print:
+                print(
+                    f"Thread {thread_id}, Overall Step {overall_steps}, Reward: {total_reward}, Smooth Reward: {smooth_reward}"
+                )
+                last_print = overall_steps + 1000
             episodes += 1
             ep_rewards.append(total_reward)
 
