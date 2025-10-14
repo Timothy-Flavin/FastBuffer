@@ -26,7 +26,7 @@ class FastBuffer:
         self.n_agents = n_agents
         self.gpu_enabled = gpu
         self.has_action_mask = action_mask
-        self.discrete_cardonalites = discrete_cardonalities
+        self.discrete_cardonalities = discrete_cardonalities
         self.registered_vars = registered_vars
         self.current_cpu_idx = 0
         self.last_gpu_idx = 0
@@ -35,6 +35,12 @@ class FastBuffer:
         # If the CPU has wrapped around and then passed up the last_gup_idx
         # then the whole buffer needs to get copied over
         self.full_buffer_refresh = False
+
+        self.copy_stream = None
+        self.copy_event = None
+        if self.gpu_enabled:
+            self.copy_stream = torch.cuda.Stream()
+            self.copy_event = torch.cuda.Event()
 
     def setup_tensors(self):
         self.cpu_tensors = {}
@@ -57,14 +63,16 @@ class FastBuffer:
             # tensors with pinned memory to allow non-blocking (async)
             # transfers to the device.
             if self.gpu_enabled:
+                assert self.gpu_tensors is not None
+                gt = self.gpu_tensors
                 self.cpu_tensors[k] = torch.zeros(
                     *dim, dtype=v["dtype"], pin_memory=True
                 )
-                self.gpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
+                gt[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
             else:
                 self.cpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"])
 
-        if self.has_action_mask:
+        if self.has_action_mask and self.discrete_cardonalities is not None:
             self.masks = []
             self.next_masks = []
             for k in self.discrete_cardonalities:
@@ -74,10 +82,10 @@ class FastBuffer:
             self.cpu_tensors["action_mask"] = self.masks
             self.cpu_tensors["action_mask_"] = self.next_masks
             if self.gpu_enabled:
-                self.gpu_tensors["action_mask"] = [
-                    torch.ones_like(m).cuda() for m in self.masks
-                ]
-                self.gpu_tensors["action_mask_"] = [
+                assert self.gpu_tensors is not None
+                gt = self.gpu_tensors
+                gt["action_mask"] = [torch.ones_like(m).cuda() for m in self.masks]
+                gt["action_mask_"] = [
                     torch.ones_like(m).cuda() for m in self.next_masks
                 ]
         self.initialized = True
@@ -90,13 +98,10 @@ class FastBuffer:
                 raise KeyError(f"Key {k} not registered in buffer")
             v = self.registered_vars[k]
             if v["per_agent"]:
-                self.cpu_tensors[k][:, self.current_cpu_idx] = torch.tensor(
-                    data[k], dtype=v["dtype"]
-                )
+                self.cpu_tensors[k][:, self.current_cpu_idx] = data[k]
             else:
-                self.cpu_tensors[k][self.current_cpu_idx] = (
-                    torch.tensor(data[k], dtype=v["dtype"]).detach().clone()
-                )
+                self.cpu_tensors[k][self.current_cpu_idx] = data[k]
+
         self.current_cpu_idx += 1
         self.steps_recorded = min(self.steps_recorded + 1, self.buffer_len)
         if self.current_cpu_idx >= self.buffer_len:
@@ -112,86 +117,82 @@ class FastBuffer:
     def update_gpu(self):
         if not self.gpu_enabled:
             raise RuntimeError("GPU not enabled for this buffer")
-        if self.full_buffer_refresh:
-            for k in self.registered_vars.keys():
-                # detach and clone to avoid warnings about views or autograd
-                # tracked tensors, then transfer to GPU using non_blocking
-                # copy (effective when CPU tensors are pinned).
-                self.gpu_tensors[k][:] = (
-                    self.cpu_tensors[k][:]
-                    .detach()
-                    .clone()
-                    .to(self.gpu_tensors[k].device, non_blocking=True)
-                )
-            if self.has_action_mask:
-                for i in range(len(self.masks)):
-                    self.gpu_tensors["action_mask"][i][:] = (
-                        self.cpu_tensors["action_mask"][i][:]
-                        .detach()
-                        .clone()
-                        .to(
-                            self.gpu_tensors["action_mask"][i].device, non_blocking=True
-                        )
-                    )
-                    self.gpu_tensors["action_mask_"][i][:] = (
-                        self.cpu_tensors["action_mask_"][i][:]
-                        .detach()
-                        .clone()
-                        .to(
-                            self.gpu_tensors["action_mask_"][i].device,
-                            non_blocking=True,
-                        )
-                    )
-            self.full_buffer_refresh = False
-        else:
-            if self.current_cpu_idx > self.last_gpu_idx:
-                idxs = slice(self.last_gpu_idx, self.current_cpu_idx)
-                gpu_idxs = idxs
-            else:
-                idxs = torch.concatenate(
-                    (
-                        torch.arange(self.last_gpu_idx, self.buffer_len),
-                        torch.arange(0, self.current_cpu_idx),
-                    )
-                )
-                gpu_idxs = idxs.detach().clone().cuda()
-            for k in self.registered_vars.keys():
-                # Copy slices safely: detach and clone on CPU then transfer
-                # non-blocking to GPU (requires pinned CPU memory to be async).
-                if self.registered_vars[k]["per_agent"]:
-                    self.gpu_tensors[k][:, gpu_idxs] = (
-                        self.cpu_tensors[k][:, idxs]
-                        .detach()
-                        .clone()
-                        .to(self.gpu_tensors[k].device, non_blocking=True)
-                    )
-                else:
-                    self.gpu_tensors[k][gpu_idxs] = (
-                        self.cpu_tensors[k][idxs]
-                        .detach()
-                        .clone()
-                        .to(self.gpu_tensors[k].device, non_blocking=True)
-                    )
+        # These are initialized in __init__ when gpu is enabled
+        assert self.copy_stream is not None
+        assert self.copy_event is not None
+        assert self.gpu_tensors is not None
 
-            if self.has_action_mask:
-                for i in range(len(self.masks)):
-                    self.gpu_tensors["action_mask"][i][:, gpu_idxs] = (
-                        self.cpu_tensors["action_mask"][i][:, idxs]
+        # Perform all device copies on the dedicated copy stream
+        with torch.cuda.stream(self.copy_stream):  # type: ignore[arg-type]
+            gt = self.gpu_tensors  # local alias for type checkers
+            if self.full_buffer_refresh:
+                for k in self.registered_vars.keys():
+                    gt[k][:] = (
+                        self.cpu_tensors[k][:]
                         .detach()
                         .clone()
-                        .to(
-                            self.gpu_tensors["action_mask"][i].device, non_blocking=True
+                        .to(gt[k].device, non_blocking=True)
+                    )
+                if self.has_action_mask:
+                    for i in range(len(self.masks)):
+                        gt["action_mask"][i][:] = (
+                            self.cpu_tensors["action_mask"][i][:]
+                            .detach()
+                            .clone()
+                            .to(gt["action_mask"][i].device, non_blocking=True)
+                        )
+                        gt["action_mask_"][i][:] = (
+                            self.cpu_tensors["action_mask_"][i][:]
+                            .detach()
+                            .clone()
+                            .to(gt["action_mask_"][i].device, non_blocking=True)
+                        )
+                self.full_buffer_refresh = False
+            else:
+                if self.current_cpu_idx > self.last_gpu_idx:
+                    idxs = slice(self.last_gpu_idx, self.current_cpu_idx)
+                    gpu_idxs = idxs
+                else:
+                    idxs = torch.concatenate(
+                        (
+                            torch.arange(self.last_gpu_idx, self.buffer_len),
+                            torch.arange(0, self.current_cpu_idx),
                         )
                     )
-                    self.gpu_tensors["action_mask_"][i][:, gpu_idxs] = (
-                        self.cpu_tensors["action_mask_"][i][:, idxs]
-                        .detach()
-                        .clone()
-                        .to(
-                            self.gpu_tensors["action_mask_"][i].device,
-                            non_blocking=True,
+                    gpu_idxs = idxs.detach().clone().cuda()
+                for k in self.registered_vars.keys():
+                    if self.registered_vars[k]["per_agent"]:
+                        gt[k][:, gpu_idxs] = (
+                            self.cpu_tensors[k][:, idxs]
+                            .detach()
+                            .clone()
+                            .to(gt[k].device, non_blocking=True)
                         )
-                    )
+                    else:
+                        gt[k][gpu_idxs] = (
+                            self.cpu_tensors[k][idxs]
+                            .detach()
+                            .clone()
+                            .to(gt[k].device, non_blocking=True)
+                        )
+
+                if self.has_action_mask:
+                    for i in range(len(self.masks)):
+                        gt["action_mask"][i][:, gpu_idxs] = (
+                            self.cpu_tensors["action_mask"][i][:, idxs]
+                            .detach()
+                            .clone()
+                            .to(gt["action_mask"][i].device, non_blocking=True)
+                        )
+                        gt["action_mask_"][i][:, gpu_idxs] = (
+                            self.cpu_tensors["action_mask_"][i][:, idxs]
+                            .detach()
+                            .clone()
+                            .to(gt["action_mask_"][i].device, non_blocking=True)
+                        )
+
+        # Record event so compute stream can wait before reading
+        self.copy_event.record(self.copy_stream)  # type: ignore[arg-type]
         self.last_gpu_idx = self.current_cpu_idx
         self.gpu_steps_recorded = self.steps_recorded
 
@@ -209,7 +210,12 @@ class FastBuffer:
                 f"Not enough steps recorded to sample {batch_size} transitions"
             )
         if idxs is None:
-            idxs = np.random.randint(0, steps_recorded, size=batch_size)
+            idxs = torch.randint(
+                0,
+                steps_recorded,
+                size=(batch_size,),
+                device=tensors[list(self.registered_vars.keys())[0]].device,
+            )
         batch = {}
         for k in self.registered_vars.keys():
             v = self.registered_vars[k]
@@ -237,12 +243,14 @@ class FastBuffer:
         for k in self.registered_vars.keys():
             self.cpu_tensors[k].zero_()
             if self.gpu_enabled:
+                assert self.gpu_tensors is not None
                 self.gpu_tensors[k].zero_()
         if self.has_action_mask:
             for i in range(len(self.masks)):
                 self.masks[i].fill_(1)
                 self.next_masks[i].fill_(1)
             if self.gpu_enabled:
+                assert self.gpu_tensors is not None
                 for i in range(len(self.masks)):
                     self.gpu_tensors["action_mask"][i].fill_(1)
                     self.gpu_tensors["action_mask_"][i].fill_(1)

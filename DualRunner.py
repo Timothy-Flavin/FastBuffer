@@ -1,4 +1,4 @@
-from threading import Thread, Lock, Event, Condition
+from threading import Thread, Lock
 import gymnasium as gym
 import random
 import math
@@ -6,10 +6,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-import numpy as np
 import time
 from FastBuffer import FastBuffer
-import matplotlib.pyplot as plt
 
 NUM_STEPS = 50000
 BUFFER_LEN = 10000
@@ -83,6 +81,10 @@ def update_thread(model_manager: ModelManager, memory_buffers: list[FastBuffer])
     global BATCH_SIZE
     step = 1
     gpu_net = model_manager.gpu_model
+    total_lock_time = 0.0
+    total_sample_time = 0.0
+    total_compute_time = 0.0
+
     while not all(model_manager.collectors_done):
         step_inc = 0
         for i, m in enumerate(memory_buffers):
@@ -91,9 +93,28 @@ def update_thread(model_manager: ModelManager, memory_buffers: list[FastBuffer])
                 continue
             step_inc = 1
             try:
+                t0 = time.time()
                 model_manager.gpu_buffer_locks[i].acquire()
+                t1 = time.time()
+                # Ensure that any outstanding H2D copies enqueued by the
+                # collector's update_gpu() are completed before we read
+                # from the GPU tensors. This allows copies to occur on a
+                # dedicated copy stream while compute proceeds on the
+                # default compute stream.
+                if getattr(m, "copy_event", None) is not None:
+                    torch.cuda.current_stream().wait_event(m.copy_event)  # type: ignore[arg-type]
+                t2 = time.time()
                 batch, idx = m.sample_transitions(BATCH_SIZE)
+                t3 = time.time()
                 update_model(gpu_net, batch, model_manager.optimizer)
+                t4 = time.time()
+                total_lock_time += t1 - t0
+                total_sample_time += t3 - t2
+                total_compute_time += t4 - t3
+                if step % 1024 == 0:
+                    print(
+                        f"Thread {i} lock {total_lock_time:.4f}s sample {total_sample_time:.4f}s compute {total_compute_time:.4f}s "
+                    )
             finally:
                 model_manager.gpu_buffer_locks[i].release()
         step += step_inc
