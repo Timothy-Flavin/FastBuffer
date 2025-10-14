@@ -87,8 +87,8 @@ class FastBuffer:
                     data[k], dtype=v["dtype"]
                 )
             else:
-                self.cpu_tensors[k][self.current_cpu_idx] = torch.tensor(
-                    data[k], dtype=v["dtype"]
+                self.cpu_tensors[k][self.current_cpu_idx] = (
+                    torch.tensor(data[k], dtype=v["dtype"]).detach().clone()
                 )
         self.current_cpu_idx += 1
         self.steps_recorded = min(self.steps_recorded + 1, self.buffer_len)
@@ -155,10 +155,16 @@ class FastBuffer:
             tensors = self.gpu_tensors
         else:
             tensors = self.cpu_tensors
-
-        last_idx = self.steps_recorded if not self.gpu_enabled else self.last_gpu_idx
+        assert tensors is not None, "Tensors not initialized"
+        steps_recorded = (
+            self.steps_recorded if not self.gpu_enabled else self.gpu_steps_recorded
+        )
+        if steps_recorded < batch_size:
+            raise ValueError(
+                f"Not enough steps recorded to sample {batch_size} transitions"
+            )
         if idxs is None:
-            idxs = np.random.randint(0, last_idx, size=batch_size)
+            idxs = np.random.randint(0, steps_recorded, size=batch_size)
         batch = {}
         for k in self.registered_vars.keys():
             v = self.registered_vars[k]
