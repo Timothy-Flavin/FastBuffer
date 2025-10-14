@@ -180,7 +180,7 @@ def main():
     global NUM_STEPS
     device = "cuda" if torch.cuda.is_available() else "cpu"
     env_name = "CartPole-v1"
-    n_threads = 2
+    n_threads = 1
     env = gym.make(env_name)
     n_actions = env.action_space.n
     state, info = env.reset()

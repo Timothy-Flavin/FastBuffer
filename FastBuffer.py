@@ -107,7 +107,12 @@ class FastBuffer:
             raise RuntimeError("GPU not enabled for this buffer")
         if self.full_buffer_refresh:
             for k in self.registered_vars.keys():
-                self.gpu_tensors[k][:] = self.cpu_tensors[k][:]
+                self.gpu_tensors[k][:] = (
+                    self.cpu_tensors[k][:]
+                    .detach()
+                    .clone()
+                    .to(self.gpu_tensors[k].device)
+                )
             if self.has_action_mask:
                 for i in range(len(self.masks)):
                     self.gpu_tensors["action_mask"][i][:] = self.cpu_tensors[
