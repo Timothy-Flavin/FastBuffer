@@ -1,2 +1,4 @@
 Laptop cartpole 50k steps 187.54200553894043s on device: cuda
 Laptop cartpole 50k steps 161.24609780311584s on device: cpu
+Desktop cartpole 50k steps Time elapsed: 35.44086694717407s on device: cpu
+Desktop cartpole 50k steps Time elapsed: 33.517842292785645s on device: cuda

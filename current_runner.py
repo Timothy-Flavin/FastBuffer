@@ -1,7 +1,7 @@
 # Example single agent using flexibuff
 # with torch dqn example modified from
 # https://pytorch.org/tutorials/intermediate/reinforcement_q_learning.html
-import gym
+import gymnasium as gym
 from flexibuff import FlexibleBuffer
 import random
 import math
@@ -132,7 +132,7 @@ def rollout_worker(env, model, buffer, optimizer, num_steps):
 
 if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    device = "cpu"
+    # device = "cpu"
     NUM_STEPS = 50000
     BATCH_SIZE = 256
     GAMMA = 0.99

@@ -52,6 +52,7 @@ class FastBuffer:
                     v["dim"] = [v["dim"]]
                 if isinstance(v["dim"], typing.Iterable):
                     dim = dim + list(v["dim"])
+            print(f"Setting up tensor {k} with dim {dim} and dtype {v['dtype']}")
             self.cpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"])
             if self.gpu_enabled:
                 self.gpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
@@ -74,7 +75,7 @@ class FastBuffer:
                 ]
         self.initialized = True
 
-    def record_step(self, data: dict):
+    def save_transition(self, data: dict):
         if not hasattr(self, "initialized"):
             self.setup_tensors()
         for k in data.keys():
@@ -119,18 +120,31 @@ class FastBuffer:
         else:
             if self.current_cpu_idx > self.last_gpu_idx:
                 idxs = slice(self.last_gpu_idx, self.current_cpu_idx)
+                gpu_idxs = idxs
             else:
-                idxs = list(range(self.last_gpu_idx, self.buffer_len)) + list(
-                    range(0, self.current_cpu_idx)
+                idxs = torch.concatenate(
+                    (
+                        torch.arange(self.last_gpu_idx, self.buffer_len),
+                        torch.arange(0, self.current_cpu_idx),
+                    )
                 )
+                gpu_idxs = idxs.detach().clone().cuda()
             for k in self.registered_vars.keys():
-                self.gpu_tensors[k][:, idxs] = self.cpu_tensors[k][:, idxs]
+                if self.registered_vars[k]["per_agent"]:
+                    self.gpu_tensors[k][:, gpu_idxs] = self.cpu_tensors[k][:, idxs].to(
+                        self.gpu_tensors[k].device
+                    )
+                else:
+                    self.gpu_tensors[k][gpu_idxs] = self.cpu_tensors[k][idxs].to(
+                        self.gpu_tensors[k].device
+                    )
+
             if self.has_action_mask:
                 for i in range(len(self.masks)):
-                    self.gpu_tensors["action_mask"][i][:, idxs] = self.cpu_tensors[
+                    self.gpu_tensors["action_mask"][i][:, gpu_idxs] = self.cpu_tensors[
                         "action_mask"
                     ][i][:, idxs]
-                    self.gpu_tensors["action_mask_"][i][:, idxs] = self.cpu_tensors[
+                    self.gpu_tensors["action_mask_"][i][:, gpu_idxs] = self.cpu_tensors[
                         "action_mask_"
                     ][i][:, idxs]
         self.last_gpu_idx = self.current_cpu_idx
@@ -160,3 +174,24 @@ class FastBuffer:
                 m[:, idxs].clone().detach() for m in tensors["action_mask_"]
             ]
         return batch, idxs
+
+    def reset(self):
+        self.steps_recorded = 0
+        self.gpu_steps_recorded = 0
+        self.current_idx = 0
+        self.current_cpu_idx = 0
+        self.last_gpu_idx = 0
+        self.cpu_wrap_around = False
+        self.full_buffer_refresh = False
+        for k in self.registered_vars.keys():
+            self.cpu_tensors[k].zero_()
+            if self.gpu_enabled:
+                self.gpu_tensors[k].zero_()
+        if self.has_action_mask:
+            for i in range(len(self.masks)):
+                self.masks[i].fill_(1)
+                self.next_masks[i].fill_(1)
+            if self.gpu_enabled:
+                for i in range(len(self.masks)):
+                    self.gpu_tensors["action_mask"][i].fill_(1)
+                    self.gpu_tensors["action_mask_"][i].fill_(1)
