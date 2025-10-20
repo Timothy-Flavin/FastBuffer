@@ -18,8 +18,10 @@ class FastBuffer:
             "discrete_action": {"dim": 1, "dtype": torch.long, "per_agent": True},
             "continuous_action": {"dim": 2, "dtype": torch.float64, "per_agent": True},
         },
+        default_device="cpu",
     ):
         self.buffer_len = buffer_len
+        self.default_device = default_device
         self.steps_recorded = 0
         self.gpu_steps_recorded = 0
         self.current_idx = 0
@@ -70,15 +72,21 @@ class FastBuffer:
                 )
                 gt[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
             else:
-                self.cpu_tensors[k] = torch.zeros(*dim, dtype=v["dtype"])
+                self.cpu_tensors[k] = torch.zeros(
+                    *dim, dtype=v["dtype"], device=self.default_device
+                )
 
         if self.has_action_mask and self.discrete_cardonalities is not None:
             self.masks = []
             self.next_masks = []
             for k in self.discrete_cardonalities:
                 dim = self.n_agents, self.buffer_len, k
-                self.masks.append(torch.ones(*dim, dtype=torch.bool))
-                self.next_masks.append(torch.ones(*dim, dtype=torch.bool))
+                self.masks.append(
+                    torch.ones(*dim, dtype=torch.bool, device=self.default_device)
+                )
+                self.next_masks.append(
+                    torch.ones(*dim, dtype=torch.bool, device=self.default_device)
+                )
             self.cpu_tensors["action_mask"] = self.masks
             self.cpu_tensors["action_mask_"] = self.next_masks
             if self.gpu_enabled:
