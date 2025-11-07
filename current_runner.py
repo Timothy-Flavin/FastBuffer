@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import time
 
+DELAY_ENV = True
+
 
 class DQN(nn.Module):
     def __init__(self, n_observations, n_actions):
@@ -88,45 +90,53 @@ def optimize_model(model, buffer, optimizer):
 
 
 def rollout_worker(env, model, buffer, optimizer, num_steps):
+    global DELAY_ENV
     ts = []
     es = []
     i_episode = 0
     step = 0
+    total_updates = 0
     while step < num_steps:
         # Initialize the environment and get its state
         es.append(0)
         done = False
         state, info = env.reset()
         t = 0
-        while not done:
-            t += 1
-            action = select_action(state, model)
-            state_, reward, terminated, truncated, _ = env.step(action)
-            es[-1] += reward
-            done = terminated or truncated
+        while not done and step < num_steps:
+            if buffer.steps_recorded < BATCH_SIZE:
 
-            # Store the transition in memory which accepts np arrays
-            buffer.save_transition(
-                terminated=terminated,
-                registered_vals={
-                    "global_rewards": reward,
-                    "obs": [state],
-                    "obs_": [state_],
-                    "discrete_actions": [[action]],
-                },
-            )
+                t += 1
+                action = select_action(state, model)
+                state_, reward, terminated, truncated, _ = env.step(action)
+                if DELAY_ENV:
+                    for q in range(100000):
+                        x = q / 7
+                es[-1] += reward
+                done = terminated or truncated
 
-            # Move to the next state
-            state = state_
+                # Store the transition in memory which accepts np arrays
+                buffer.save_transition(
+                    terminated=terminated,
+                    registered_vals={
+                        "global_rewards": reward,
+                        "obs": [state],
+                        "obs_": [state_],
+                        "discrete_actions": [[action]],
+                    },
+                )
+
+                # Move to the next state
+                state = state_
 
             # Perform one step of the optimization (on the policy network)
             optimize_model(model, buffer, optimizer)
-
+            total_updates += 1
             if done:
                 print(f"len: {t} ep: {i_episode} total_step: {step}")
                 ts.append(t)
                 i_episode += 1
             step += 1
+    print(f"total updates: {total_updates}")
     return ts, es
 
 
@@ -134,6 +144,8 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # device = "cpu"
     NUM_STEPS = 50000
+    if DELAY_ENV:
+        NUM_STEPS = 5000
     BATCH_SIZE = 256
     GAMMA = 0.99
     EPS_START = 0.9

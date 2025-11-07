@@ -19,6 +19,9 @@ EPS_DECAY = 1000
 LR = 1e-4
 MODEL_SYNC_EVERY = 5
 MEMORY_SYNC_EVERY = 1024
+DELAY_ENV = True
+if DELAY_ENV:
+    NUM_STEPS = 5000
 
 
 class DQN(nn.Module):
@@ -84,6 +87,7 @@ def update_thread(model_manager: ModelManager, memory_buffers: list[FastBuffer])
     total_lock_time = 0.0
     total_sample_time = 0.0
     total_compute_time = 0.0
+    total_updates = 0
 
     while not all(model_manager.collectors_done):
         step_inc = 0
@@ -92,6 +96,7 @@ def update_thread(model_manager: ModelManager, memory_buffers: list[FastBuffer])
                 time.sleep(0.01)
                 continue
             step_inc = 1
+            total_updates += 1
             try:
                 t0 = time.time()
                 model_manager.gpu_buffer_locks[i].acquire()
@@ -122,7 +127,8 @@ def update_thread(model_manager: ModelManager, memory_buffers: list[FastBuffer])
             net = model_manager.cpu_models[1 - model_manager.active_model]
             net.load_state_dict(gpu_net.state_dict())
             model_manager.active_model = 1 - model_manager.active_model
-            print(f"Model updated to {model_manager.active_model}")
+            # print(f"Model updated to {model_manager.active_model}")
+    print(f"total updates: {total_updates}")
 
 
 def runner_thread(
@@ -132,7 +138,7 @@ def runner_thread(
     env_name: str,
     max_steps: int,
 ):
-    global EPS_START, EPS_END, EPS_DECAY, MEMORY_SYNC_EVERY
+    global EPS_START, EPS_END, EPS_DECAY, MEMORY_SYNC_EVERY, DELAY_ENV
     env = gym.make(env_name)
     n_actions = env.action_space.n
     obs, _ = env.reset()
@@ -156,6 +162,9 @@ def runner_thread(
             model = model_manager.cpu_models[model_idx]
             action = get_action(model, obs.unsqueeze(0), epsilon, n_actions)
             next_obs, reward, terminated, truncated, info = env.step(action)
+            if DELAY_ENV:
+                for q in range(100000):
+                    x = q / 7
             next_obs = torch.tensor(next_obs, dtype=torch.float32)
             memory_buffer.save_transition(
                 data={
@@ -225,7 +234,7 @@ def main():
             FastBuffer(
                 buffer_len=BUFFER_LEN,
                 n_agents=1,
-                gpu=True,
+                gpu_double_buffer=True,
                 action_mask=False,
                 discrete_cardonalities=None,
                 registered_vars={

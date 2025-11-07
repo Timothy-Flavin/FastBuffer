@@ -349,7 +349,7 @@ if __name__ == "__main__":
                         "per_agent": False,
                     },
                 },
-                gpu=(device == "cuda"),
+                gpu_double_buffer=(device == "cuda"),
             )
         )
         buffer_locks.append(Lock())

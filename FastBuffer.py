@@ -8,7 +8,7 @@ class FastBuffer:
         self,
         buffer_len: int,
         n_agents: int = 1,
-        gpu: bool = False,
+        gpu_double_buffer: bool = False,
         action_mask: bool = False,
         discrete_cardonalities: typing.Iterable | None = None,
         registered_vars={
@@ -26,7 +26,7 @@ class FastBuffer:
         self.gpu_steps_recorded = 0
         self.current_idx = 0
         self.n_agents = n_agents
-        self.gpu_enabled = gpu
+        self.gpu_enabled = gpu_double_buffer
         self.has_action_mask = action_mask
         self.discrete_cardonalities = discrete_cardonalities
         self.registered_vars = registered_vars
@@ -115,6 +115,69 @@ class FastBuffer:
         if self.current_cpu_idx >= self.buffer_len:
             self.current_cpu_idx = 0
             self.cpu_wrap_around = True
+        if (
+            self.cpu_wrap_around
+            and self.gpu_enabled
+            and self.current_cpu_idx == self.last_gpu_idx
+        ):
+            self.full_buffer_refresh = True
+
+    def save_batch(self, data: dict, count: int):
+        """Efficiently write a contiguous batch of transitions into the CPU buffer.
+
+        Assumptions for simplicity (satisfies current usage):
+        - All variables are per_agent=False (shape [buffer_len, ...]).
+        - `count` <= buffer_len.
+        - `data[k]` are CPU tensors or numpy-backed tensors with first dim == count.
+        """
+        if count <= 0:
+            return
+        if not hasattr(self, "initialized"):
+            self.setup_tensors()
+
+        # Validate keys and shapes minimally
+        for k in data.keys():
+            if k not in self.registered_vars:
+                raise KeyError(f"Key {k} not registered in buffer")
+            if self.registered_vars[k]["per_agent"]:
+                raise ValueError(
+                    "save_batch currently supports per_agent=False variables only"
+                )
+
+        start_idx = self.current_cpu_idx
+        end_idx = start_idx + count
+        # Two-segment write if we wrap
+        if end_idx <= self.buffer_len:
+            # Single segment
+            slc = slice(start_idx, end_idx)
+            for k, v in data.items():
+                dst = self.cpu_tensors[k]
+                # Ensure dtype/device
+                if not isinstance(v, torch.Tensor):
+                    v = torch.as_tensor(v)
+                if v.dtype != dst.dtype:
+                    v = v.to(dtype=dst.dtype)
+                dst[slc] = v
+        else:
+            first_len = self.buffer_len - start_idx
+            second_len = end_idx - self.buffer_len
+            # first segment
+            slc1 = slice(start_idx, self.buffer_len)
+            # second segment wraps to 0
+            slc2 = slice(0, second_len)
+            for k, v in data.items():
+                dst = self.cpu_tensors[k]
+                if not isinstance(v, torch.Tensor):
+                    v = torch.as_tensor(v)
+                if v.dtype != dst.dtype:
+                    v = v.to(dtype=dst.dtype)
+                dst[slc1] = v[:first_len]
+                dst[slc2] = v[first_len : first_len + second_len]
+            self.cpu_wrap_around = True
+
+        # Update indices and flags
+        self.current_cpu_idx = end_idx % self.buffer_len
+        self.steps_recorded = min(self.steps_recorded + count, self.buffer_len)
         if (
             self.cpu_wrap_around
             and self.gpu_enabled
