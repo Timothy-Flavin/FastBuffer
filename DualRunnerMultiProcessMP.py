@@ -27,13 +27,14 @@ EPS_START = 0.9
 EPS_END = 0.05
 EPS_DECAY = 1000
 LR = 1e-4
-MODEL_SYNC_EVERY = 5
-MEMORY_SYNC_EVERY = 1024
+MODEL_SYNC_EVERY = 128
+MEMORY_SYNC_EVERY = 256
 # Size of batches staged in shared memory from collector to learner.
 STAGING_BATCH = MEMORY_SYNC_EVERY
 DELAY_ENV = True
+DELAY_ITERS = 100000
 if DELAY_ENV:
-    NUM_STEPS = 5000
+    NUM_STEPS = 50000
 
 
 # ---------------------
@@ -246,7 +247,7 @@ def collector_process(
             next_obs, reward, terminated, truncated, _info = env.step(action)
 
             if DELAY_ENV:
-                for q in range(100000):
+                for q in range(DELAY_ITERS):
                     _ = q / 7
 
             # Accumulate locally
@@ -382,10 +383,11 @@ def learner_process(
         drained += drain_slot(s0, slot_flags[0], slot_sizes[0])
         drained += drain_slot(s1, slot_flags[1], slot_sizes[1])
 
+        # Attempt to swap GPU buffers if the previous async copy completed
+        buffer.maybe_swap_device()
+
         # Train if enough GPU-side samples are available
         if buffer.gpu_steps_recorded >= BATCH_SIZE * 2:
-            if getattr(buffer, "copy_event", None) is not None:
-                torch.cuda.current_stream().wait_event(buffer.copy_event)  # type: ignore[arg-type]
             t0 = time.time()
             batch, _ = buffer.sample_transitions(BATCH_SIZE)
             t1 = time.time()

@@ -26,6 +26,8 @@ class FastBuffer:
         self.gpu_steps_recorded = 0
         self.current_idx = 0
         self.n_agents = n_agents
+        # Historical param name "gpu_double_buffer" has been used to mean GPU-enabled.
+        # We'll enable real double-buffering when GPU is enabled.
         self.gpu_enabled = gpu_double_buffer
         self.has_action_mask = action_mask
         self.discrete_cardonalities = discrete_cardonalities
@@ -40,6 +42,12 @@ class FastBuffer:
 
         self.copy_stream = None
         self.copy_event = None
+        # Double buffer fields
+        self.gpu_tensors_front = None  # active for sampling
+        self.gpu_tensors_back = None  # target for async copies
+        self.has_pending_swap = False
+        self._pending_steps_recorded = 0
+        self._pending_last_gpu_idx = 0
         if self.gpu_enabled:
             self.copy_stream = torch.cuda.Stream()
             self.copy_event = torch.cuda.Event()
@@ -48,7 +56,9 @@ class FastBuffer:
         self.cpu_tensors = {}
         self.gpu_tensors = None
         if self.gpu_enabled:
-            self.gpu_tensors = {}
+            # Two GPU buffers for overlap: front (read), back (write)
+            self.gpu_tensors_front = {}
+            self.gpu_tensors_back = {}
         for k in self.registered_vars.keys():
             v = self.registered_vars[k]
             dim = []
@@ -65,12 +75,15 @@ class FastBuffer:
             # tensors with pinned memory to allow non-blocking (async)
             # transfers to the device.
             if self.gpu_enabled:
-                assert self.gpu_tensors is not None
-                gt = self.gpu_tensors
+                assert (
+                    self.gpu_tensors_front is not None
+                    and self.gpu_tensors_back is not None
+                )
                 self.cpu_tensors[k] = torch.zeros(
                     *dim, dtype=v["dtype"], pin_memory=True
                 )
-                gt[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
+                self.gpu_tensors_front[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
+                self.gpu_tensors_back[k] = torch.zeros(*dim, dtype=v["dtype"]).cuda()
             else:
                 self.cpu_tensors[k] = torch.zeros(
                     *dim, dtype=v["dtype"], device=self.default_device
@@ -90,13 +103,26 @@ class FastBuffer:
             self.cpu_tensors["action_mask"] = self.masks
             self.cpu_tensors["action_mask_"] = self.next_masks
             if self.gpu_enabled:
-                assert self.gpu_tensors is not None
-                gt = self.gpu_tensors
-                gt["action_mask"] = [torch.ones_like(m).cuda() for m in self.masks]
-                gt["action_mask_"] = [
+                assert (
+                    self.gpu_tensors_front is not None
+                    and self.gpu_tensors_back is not None
+                )
+                self.gpu_tensors_front["action_mask"] = [
+                    torch.ones_like(m).cuda() for m in self.masks
+                ]
+                self.gpu_tensors_front["action_mask_"] = [
+                    torch.ones_like(m).cuda() for m in self.next_masks
+                ]
+                self.gpu_tensors_back["action_mask"] = [
+                    torch.ones_like(m).cuda() for m in self.masks
+                ]
+                self.gpu_tensors_back["action_mask_"] = [
                     torch.ones_like(m).cuda() for m in self.next_masks
                 ]
         self.initialized = True
+        # Expose active gpu_tensors alias for backward compatibility
+        if self.gpu_enabled:
+            self.gpu_tensors = self.gpu_tensors_front
 
     def save_transition(self, data: dict):
         if not hasattr(self, "initialized"):
@@ -191,11 +217,11 @@ class FastBuffer:
         # These are initialized in __init__ when gpu is enabled
         assert self.copy_stream is not None
         assert self.copy_event is not None
-        assert self.gpu_tensors is not None
+        assert self.gpu_tensors_front is not None and self.gpu_tensors_back is not None
 
         # Perform all device copies on the dedicated copy stream
         with torch.cuda.stream(self.copy_stream):  # type: ignore[arg-type]
-            gt = self.gpu_tensors  # local alias for type checkers
+            gt = self.gpu_tensors_back  # write into back buffer
             if self.full_buffer_refresh:
                 for k in self.registered_vars.keys():
                     gt[k][:] = (
@@ -260,8 +286,36 @@ class FastBuffer:
 
         # Record event so compute stream can wait before reading
         self.copy_event.record(self.copy_stream)  # type: ignore[arg-type]
-        self.last_gpu_idx = self.current_cpu_idx
-        self.gpu_steps_recorded = self.steps_recorded
+        # Mark pending swap; record values that will become active once swap completes
+        self._pending_last_gpu_idx = self.current_cpu_idx
+        self._pending_steps_recorded = self.steps_recorded
+        self.has_pending_swap = True
+
+    def maybe_swap_device(self):
+        """If the pending async copy has completed, swap front/back buffers.
+
+        This enables overlap of H2D copies (into back) and compute/sampling (from front).
+        """
+        if not self.gpu_enabled:
+            return
+        if not self.has_pending_swap:
+            return
+        assert self.copy_event is not None
+        if self.copy_event.query():  # type: ignore[attr-defined]
+            # Swap buffers
+            assert (
+                self.gpu_tensors_front is not None and self.gpu_tensors_back is not None
+            )
+            self.gpu_tensors_front, self.gpu_tensors_back = (
+                self.gpu_tensors_back,
+                self.gpu_tensors_front,
+            )
+            # Update alias used by sampling
+            self.gpu_tensors = self.gpu_tensors_front
+            # Make the copied data visible
+            self.last_gpu_idx = self._pending_last_gpu_idx
+            self.gpu_steps_recorded = self._pending_steps_recorded
+            self.has_pending_swap = False
 
     def sample_transitions(self, batch_size, idxs=None):
         if self.gpu_enabled:
